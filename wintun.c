@@ -701,11 +701,12 @@ static NTSTATUS TunDispatch(DEVICE_OBJECT *DeviceObject, IRP *Irp)
 
 	Irp->IoStatus.Information = 0;
 
-	TUN_CTX *ctx = NdisGetDeviceReservedExtension(DeviceObject);
-	if (!ctx) {
+	TUN_CTX * volatile *ext = NdisGetDeviceReservedExtension(DeviceObject);
+	if (!ext || !*ext) {
 		status = STATUS_INVALID_HANDLE;
 		goto cleanup_complete_req;
 	}
+	TUN_CTX *ctx = *ext;
 
 	IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(Irp);
 	switch (stack->MajorFunction) {
@@ -747,8 +748,7 @@ static NTSTATUS TunDispatch(DEVICE_OBJECT *DeviceObject, IRP *Irp)
 		irql = ExAcquireSpinLockExclusive(&ctx->TransitionLock);
 		ASSERT(InterlockedGet64(&ctx->Device.RefCount) > 0);
 		if (InterlockedDecrement64(&ctx->Device.RefCount) <= 0) {
-			if (ctx->MiniportAdapterHandle)
-				TunIndicateStatus(ctx->MiniportAdapterHandle, MediaConnectStateDisconnected);
+			TunIndicateStatus(ctx->MiniportAdapterHandle, MediaConnectStateDisconnected);
 			TunQueueClear(ctx, NDIS_STATUS_SEND_ABORTED);
 		}
 		ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
@@ -882,64 +882,10 @@ static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDL
 	if (!MiniportAdapterHandle)
 		return NDIS_STATUS_FAILURE;
 
-	/* Register device first.
-	 * Having only one device per adapter allows us to store adapter context inside device extension. */
-	WCHAR device_name[(sizeof(L"\\Device\\" TUN_DEVICE_NAME) + 10/*MAXULONG as string*/) / sizeof(WCHAR)];
-	UNICODE_STRING unicode_device_name;
-	TunInitUnicodeString(&unicode_device_name, device_name);
-	RtlUnicodeStringPrintf(&unicode_device_name, L"\\Device\\" TUN_DEVICE_NAME, (ULONG)MiniportInitParameters->NetLuid.Info.NetLuidIndex);
-
-	WCHAR symbolic_name[(sizeof(L"\\DosDevices\\" TUN_DEVICE_NAME) + 10/*MAXULONG as string*/) / sizeof(WCHAR)];
-	UNICODE_STRING unicode_symbolic_name;
-	TunInitUnicodeString(&unicode_symbolic_name, symbolic_name);
-	RtlUnicodeStringPrintf(&unicode_symbolic_name, L"\\DosDevices\\" TUN_DEVICE_NAME, (ULONG)MiniportInitParameters->NetLuid.Info.NetLuidIndex);
-
-	static PDRIVER_DISPATCH dispatch_table[IRP_MJ_MAXIMUM_FUNCTION + 1] = {
-		TunDispatch,    /* IRP_MJ_CREATE                   */
-		NULL,           /* IRP_MJ_CREATE_NAMED_PIPE        */
-		TunDispatch,    /* IRP_MJ_CLOSE                    */
-		TunDispatch,    /* IRP_MJ_READ                     */
-		TunDispatch,    /* IRP_MJ_WRITE                    */
-		NULL,           /* IRP_MJ_QUERY_INFORMATION        */
-		NULL,           /* IRP_MJ_SET_INFORMATION          */
-		NULL,           /* IRP_MJ_QUERY_EA                 */
-		NULL,           /* IRP_MJ_SET_EA                   */
-		NULL,           /* IRP_MJ_FLUSH_BUFFERS            */
-		NULL,           /* IRP_MJ_QUERY_VOLUME_INFORMATION */
-		NULL,           /* IRP_MJ_SET_VOLUME_INFORMATION   */
-		NULL,           /* IRP_MJ_DIRECTORY_CONTROL        */
-		NULL,           /* IRP_MJ_FILE_SYSTEM_CONTROL      */
-		NULL,           /* IRP_MJ_DEVICE_CONTROL           */
-		NULL,           /* IRP_MJ_INTERNAL_DEVICE_CONTROL  */
-		NULL,           /* IRP_MJ_SHUTDOWN                 */
-		NULL,           /* IRP_MJ_LOCK_CONTROL             */
-		TunDispatch,    /* IRP_MJ_CLEANUP                  */
-	};
-	NDIS_DEVICE_OBJECT_ATTRIBUTES t = {
-		.Header = {
-			.Type      = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES,
-			.Revision  = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1,
-			.Size      = NDIS_SIZEOF_DEVICE_OBJECT_ATTRIBUTES_REVISION_1
-		},
-		.DeviceName        = &unicode_device_name,
-		.SymbolicName      = &unicode_symbolic_name,
-		.MajorFunctions    = dispatch_table,
-		.ExtensionSize     = sizeof(TUN_CTX),
-		.DefaultSDDLString = &SDDL_DEVOBJ_SYS_ALL /* Kernel, and SYSTEM: full control. Others: none */
-	};
-	NDIS_HANDLE handle;
-	DEVICE_OBJECT *object;
-	if (!NT_SUCCESS(NdisRegisterDeviceEx(NdisMiniportDriverHandle, &t, &object, &handle)))
+	TUN_CTX *ctx;
+	#pragma warning(suppress: 6014) /* Leaking memory 'ctx'. Note: 'ctx' is aliased in attr.MiniportAdapterContext; or freed on failure. */
+	if (!NT_SUCCESS(status = NdisAllocateMemoryWithTag(&ctx, sizeof(TUN_CTX), TUN_MEMORY_TAG)))
 		return NDIS_STATUS_FAILURE;
-
-	object->Flags &= ~DO_BUFFERED_IO;
-	object->Flags |=  DO_DIRECT_IO;
-
-	TUN_CTX *ctx = NdisGetDeviceReservedExtension(object);
-	if (!ctx) {
-		status = NDIS_STATUS_FAILURE;
-		goto cleanup_NdisDeregisterDeviceEx;
-	}
 
 	NdisZeroMemory(ctx, sizeof(*ctx));
 	ctx->State                 = TUN_STATE_INITIALIZING;
@@ -969,7 +915,6 @@ static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDL
 		NDIS_STATISTICS_FLAGS_VALID_MULTICAST_BYTES_XMIT |
 		NDIS_STATISTICS_FLAGS_VALID_BROADCAST_BYTES_XMIT;
 
-	ctx->Device.Handle = handle;
 	IoInitializeRemoveLock(&ctx->Device.RemoveLock, TUN_MEMORY_TAG, 0, 0);
 	KeInitializeSpinLock(&ctx->Device.ReadQueue.Lock);
 	IoCsqInitializeEx(&ctx->Device.ReadQueue.Csq,
@@ -997,7 +942,7 @@ static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDL
 	ctx->NBLPool = NdisAllocateNetBufferListPool(MiniportAdapterHandle, &nbl_pool_param);
 	if (!ctx->NBLPool) {
 		status = NDIS_STATUS_FAILURE;
-		goto cleanup_NdisDeregisterDeviceEx;
+		goto cleanup_ctx;
 	}
 
 	NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES attr = {
@@ -1096,14 +1041,74 @@ static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDL
 	 */
 	TunIndicateStatus(MiniportAdapterHandle, MediaConnectStateDisconnected);
 
+	WCHAR device_name[(sizeof(L"\\Device\\" TUN_DEVICE_NAME) + 10/*MAXULONG as string*/) / sizeof(WCHAR)];
+	UNICODE_STRING unicode_device_name;
+	TunInitUnicodeString(&unicode_device_name, device_name);
+	RtlUnicodeStringPrintf(&unicode_device_name, L"\\Device\\" TUN_DEVICE_NAME, (ULONG)MiniportInitParameters->NetLuid.Info.NetLuidIndex);
+
+	WCHAR symbolic_name[(sizeof(L"\\DosDevices\\" TUN_DEVICE_NAME) + 10/*MAXULONG as string*/) / sizeof(WCHAR)];
+	UNICODE_STRING unicode_symbolic_name;
+	TunInitUnicodeString(&unicode_symbolic_name, symbolic_name);
+	RtlUnicodeStringPrintf(&unicode_symbolic_name, L"\\DosDevices\\" TUN_DEVICE_NAME, (ULONG)MiniportInitParameters->NetLuid.Info.NetLuidIndex);
+
+	static PDRIVER_DISPATCH dispatch_table[IRP_MJ_MAXIMUM_FUNCTION + 1] = {
+		TunDispatch,    /* IRP_MJ_CREATE                   */
+		NULL,           /* IRP_MJ_CREATE_NAMED_PIPE        */
+		TunDispatch,    /* IRP_MJ_CLOSE                    */
+		TunDispatch,    /* IRP_MJ_READ                     */
+		TunDispatch,    /* IRP_MJ_WRITE                    */
+		NULL,           /* IRP_MJ_QUERY_INFORMATION        */
+		NULL,           /* IRP_MJ_SET_INFORMATION          */
+		NULL,           /* IRP_MJ_QUERY_EA                 */
+		NULL,           /* IRP_MJ_SET_EA                   */
+		NULL,           /* IRP_MJ_FLUSH_BUFFERS            */
+		NULL,           /* IRP_MJ_QUERY_VOLUME_INFORMATION */
+		NULL,           /* IRP_MJ_SET_VOLUME_INFORMATION   */
+		NULL,           /* IRP_MJ_DIRECTORY_CONTROL        */
+		NULL,           /* IRP_MJ_FILE_SYSTEM_CONTROL      */
+		NULL,           /* IRP_MJ_DEVICE_CONTROL           */
+		NULL,           /* IRP_MJ_INTERNAL_DEVICE_CONTROL  */
+		NULL,           /* IRP_MJ_SHUTDOWN                 */
+		NULL,           /* IRP_MJ_LOCK_CONTROL             */
+		TunDispatch,    /* IRP_MJ_CLEANUP                  */
+	};
+	NDIS_DEVICE_OBJECT_ATTRIBUTES t = {
+		.Header = {
+			.Type      = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES,
+			.Revision  = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1,
+			.Size      = NDIS_SIZEOF_DEVICE_OBJECT_ATTRIBUTES_REVISION_1
+		},
+		.DeviceName        = &unicode_device_name,
+		.SymbolicName      = &unicode_symbolic_name,
+		.MajorFunctions    = dispatch_table,
+		.ExtensionSize     = sizeof(TUN_CTX *),
+		.DefaultSDDLString = &SDDL_DEVOBJ_SYS_ALL /* Kernel, and SYSTEM: full control. Others: none */
+	};
+	DEVICE_OBJECT *object;
+	if (!NT_SUCCESS(status = NdisRegisterDeviceEx(NdisMiniportDriverHandle, &t, &object, &ctx->Device.Handle))) {
+		status = NDIS_STATUS_FAILURE;
+		goto cleanup_NdisFreeNetBufferListPool;
+	}
+
+	object->Flags &= ~DO_BUFFERED_IO;
+	object->Flags |=  DO_DIRECT_IO;
+
+	TUN_CTX * volatile *ext = NdisGetDeviceReservedExtension(object);
+	if (!ext) {
+		status = NDIS_STATUS_FAILURE;
+		goto cleanup_NdisDeregisterDeviceEx;
+	}
+	*ext = ctx;
+
 	ctx->State = TUN_STATE_PAUSED;
 	return NDIS_STATUS_SUCCESS;
 
+cleanup_NdisDeregisterDeviceEx:
+	NdisDeregisterDeviceEx(ctx->Device.Handle);
 cleanup_NdisFreeNetBufferListPool:
 	NdisFreeNetBufferListPool(ctx->NBLPool);
-	ctx->NBLPool = NULL;
-cleanup_NdisDeregisterDeviceEx:
-	NdisDeregisterDeviceEx(handle);
+cleanup_ctx:
+	NdisFreeMemory(ctx, 0, 0);
 	return status;
 }
 
@@ -1126,20 +1131,16 @@ static void TunHaltEx(NDIS_HANDLE MiniportAdapterContext, NDIS_HALT_ACTION HaltA
 	for (IRP *pending_irp; (pending_irp = IoCsqRemoveNextIrp(&ctx->Device.ReadQueue.Csq, NULL)) != NULL;)
 		TunCompleteRequest(ctx, pending_irp, 0, STATUS_FILE_FORCED_CLOSED);
 
-	NdisFreeNetBufferListPool(ctx->NBLPool);
-	ctx->NBLPool = NULL;
-
-	ctx->MiniportAdapterHandle = NULL;
+	NdisDeregisterDeviceEx(ctx->Device.Handle);
 
 	/* Wait for all device handles to close. */
-	/* TODO: Research how to close all handles from within the driver, rather than depending on client to close them. */
+	/* TODO: Research how to close all handles from within the driver, rather than depending on client to close them or waiting for timeout. */
 	IoAcquireRemoveLock(&ctx->Device.RemoveLock, NULL);
 	IoReleaseRemoveLockAndWait(&ctx->Device.RemoveLock, NULL);
 
+	NdisFreeNetBufferListPool(ctx->NBLPool);
 	InterlockedExchange((LONG *)&ctx->State, TUN_STATE_HALTED);
-
-	/* Deregister device _after_ we are done writing to ctx not to risk an UaF. The ctx is hosted by device extension. */
-	NdisDeregisterDeviceEx(ctx->Device.Handle);
+	NdisFreeMemory(ctx, 0, 0);
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
