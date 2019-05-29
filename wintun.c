@@ -952,6 +952,49 @@ static NTSTATUS TunPnpNotifyInterfaceChange(PVOID NotificationStruct, PVOID Cont
 	return STATUS_SUCCESS;
 }
 
+static MINIPORT_ADD_DEVICE TunAddDevice;
+_Use_decl_annotations_
+static NDIS_STATUS TunAddDevice(NDIS_HANDLE NdisMiniportHandle, NDIS_HANDLE MiniportDriverContext)
+{
+	return NDIS_STATUS_SUCCESS;
+}
+
+static MINIPORT_REMOVE_DEVICE TunRemoveDevice;
+_Use_decl_annotations_
+static void TunRemoveDevice(NDIS_HANDLE MiniportAddDeviceContext)
+{
+	TUN_CTX *ctx = (TUN_CTX *)MiniportAddDeviceContext;
+
+	KIRQL irql = ExAcquireSpinLockExclusive(&ctx->TransitionLock);
+	InterlockedExchange((LONG *)&ctx->State, TUN_STATE_PAUSING);
+	TunQueueClear(ctx, STATUS_NDIS_PAUSED);
+	ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
+}
+
+//static MINIPORT_FILTER_RESOURCE_REQUIREMENTS TunFilterResourceRequirements;
+//_Use_decl_annotations_
+//static NDIS_STATUS TunFilterResourceRequirements(NDIS_HANDLE MiniportAddDeviceContext, PIRP Irp)
+//{
+//	return NDIS_STATUS_SUCCESS;
+//}
+
+static MINIPORT_SET_OPTIONS TunSetOptions;
+_Use_decl_annotations_
+static NDIS_STATUS TunSetOptions(NDIS_HANDLE NdisDriverHandle, NDIS_HANDLE DriverContext)
+{
+	NDIS_MINIPORT_PNP_CHARACTERISTICS pnp_char = {
+		.Header = {
+		.Type       = NDIS_OBJECT_TYPE_MINIPORT_PNP_CHARACTERISTICS,
+		.Revision   = NDIS_MINIPORT_PNP_CHARACTERISTICS_REVISION_1,
+		.Size       = NDIS_SIZEOF_MINIPORT_PNP_CHARACTERISTICS_REVISION_1
+	},
+		.MiniportAddDeviceHandler                  = TunAddDevice,
+		.MiniportRemoveDeviceHandler               = TunRemoveDevice,
+		//.MiniportFilterResourceRequirementsHandler = TunFilterResourceRequirements,
+	};
+	return NdisSetOptionalHandlers(NdisDriverHandle, (PNDIS_DRIVER_OPTIONAL_HANDLERS)&pnp_char);
+}
+
 static MINIPORT_INITIALIZE TunInitializeEx;
 _Use_decl_annotations_
 static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDLE MiniportDriverContext, PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters)
@@ -1100,6 +1143,19 @@ static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDL
 	if (!NT_SUCCESS(status = NdisMSetMiniportAttributes(MiniportAdapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&attr))) {
 		status = NDIS_STATUS_FAILURE;
 		goto cleanup_ctx;
+	}
+
+	NDIS_MINIPORT_ADD_DEVICE_REGISTRATION_ATTRIBUTES ad_reg_attr = {
+		.Header = {
+			.Type       = NDIS_OBJECT_TYPE_MINIPORT_ADD_DEVICE_REGISTRATION_ATTRIBUTES,
+			.Revision   = NDIS_MINIPORT_ADD_DEVICE_REGISTRATION_ATTRIBUTES_REVISION_1,
+			.Size       = NDIS_SIZEOF_MINIPORT_ADD_DEVICE_REGISTRATION_ATTRIBUTES_REVISION_1
+		},
+		.MiniportAddDeviceContext = ctx
+	};
+	if (!NT_SUCCESS(status = NdisMSetMiniportAttributes(MiniportAdapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&ad_reg_attr))) {
+		status = NDIS_STATUS_FAILURE;
+		goto cleanup_NdisFreeNetBufferListPool;
 	}
 
 	NDIS_PM_CAPABILITIES pmcap = {
@@ -1481,6 +1537,7 @@ NTSTATUS DriverEntry(DRIVER_OBJECT *DriverObject, UNICODE_STRING *RegistryPath)
 		.MajorDriverVersion            = WINTUN_VERSION_MAJ,
 		.MinorDriverVersion            = WINTUN_VERSION_MIN,
 
+		.SetOptionsHandler             = TunSetOptions,
 		.InitializeHandlerEx           = TunInitializeEx,
 		.HaltHandlerEx                 = TunHaltEx,
 		.UnloadHandler                 = TunUnload,
