@@ -947,13 +947,15 @@ static NTSTATUS TunPnPNotifyDeviceChange(PVOID NotificationStruct, PVOID Context
 		return STATUS_SUCCESS;
 
 	if (IsEqualGUID(&notification->Event, &GUID_TARGET_DEVICE_QUERY_REMOVE)) {
+		KIRQL irql = ExAcquireSpinLockExclusive(&ctx->TransitionLock);
 		InterlockedExchange((LONG *)&ctx->State, TUN_STATE_PAUSING);
-		FILE_OBJECT *file = ctx->PnPNotifications.FileObject;
 		/* The entire purpose of this PnP notification infrastructure is so that we can get here.
 		 * The idea is that if there are un-returned NBLs, TunPause&TunHalt will never be called.
 		 * So we clear them here after setting the paused state, which then frees up NDIS to do
 		 * the right thing later on in the shutdown procedure. */
 		TunQueueClear(ctx, STATUS_NDIS_REQUEST_ABORTED);
+		ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
+		FILE_OBJECT *file = ctx->PnPNotifications.FileObject;
 		ctx->PnPNotifications.FileObject = NULL;
 		if (file)
 			ObDereferenceObject(file);
