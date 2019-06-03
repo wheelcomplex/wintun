@@ -80,6 +80,7 @@ typedef struct _TUN_CTX {
 		} ReadQueue;
 
 		DEVICE_OBJECT *Object;
+		PVOID NblCancelId;
 	} Device;
 
 	struct {
@@ -98,6 +99,8 @@ static UINT NdisVersion;
 static PVOID TunNotifyInterfaceChangeHandle;
 static NDIS_HANDLE NdisMiniportDriverHandle;
 static volatile LONG64 AdapterCount;
+static ULONG_PTR DriverCancelId;
+static volatile LONG64 AdapterCancelId;
 
 #if REG_DWORD == REG_DWORD_BIG_ENDIAN
 #define TUN_MEMORY_TAG  'wtun'
@@ -648,6 +651,7 @@ static NTSTATUS TunWriteFromIrp(_Inout_ TUN_CTX *ctx, _Inout_ IRP *Irp)
 		NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) = (PVOID)TunHtons(nbl_proto);
 		NET_BUFFER_LIST_STATUS(nbl) = NDIS_STATUS_SUCCESS;
 		NET_BUFFER_LIST_IRP(nbl) = Irp;
+		NDIS_SET_NET_BUFFER_LIST_CANCEL_ID(nbl, ctx->Device.NblCancelId);
 		TunAppendNBL(&nbl_head, &nbl_tail, nbl);
 		nbl_count++;
 		b += p_size;
@@ -784,8 +788,10 @@ static NTSTATUS TunDispatch(DEVICE_OBJECT *DeviceObject, IRP *Irp)
 		irql = ExAcquireSpinLockExclusive(&ctx->TransitionLock);
 		ASSERT(InterlockedGet64(&ctx->Device.RefCount) > 0);
 		if (InterlockedDecrement64(&ctx->Device.RefCount) <= 0) {
-			if (ctx->MiniportAdapterHandle)
+			if (ctx->MiniportAdapterHandle) {
 				TunIndicateStatus(ctx->MiniportAdapterHandle, MediaConnectStateDisconnected);
+				NdisCancelSendNetBufferLists(ctx->MiniportAdapterHandle, ctx->Device.NblCancelId);
+			}
 			TunQueueClear(ctx, NDIS_STATUS_SEND_ABORTED);
 		}
 		ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
@@ -824,6 +830,7 @@ static NDIS_STATUS TunPause(NDIS_HANDLE MiniportAdapterContext, PNDIS_MINIPORT_P
 
 	KIRQL irql = ExAcquireSpinLockExclusive(&ctx->TransitionLock);
 	InterlockedExchange((LONG *)&ctx->State, TUN_STATE_PAUSING);
+	NdisCancelSendNetBufferLists(ctx->MiniportAdapterHandle, ctx->Device.NblCancelId);
 	TunQueueClear(ctx, STATUS_NDIS_PAUSED);
 	ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
 
@@ -953,6 +960,7 @@ static NTSTATUS TunPnPNotifyDeviceChange(PVOID NotificationStruct, PVOID Context
 		 * The idea is that if there are un-returned NBLs, TunPause&TunHalt will never be called.
 		 * So we clear them here after setting the paused state, which then frees up NDIS to do
 		 * the right thing later on in the shutdown procedure. */
+		NdisCancelSendNetBufferLists(ctx->MiniportAdapterHandle, ctx->Device.NblCancelId);
 		TunQueueClear(ctx, STATUS_NDIS_REQUEST_ABORTED);
 		ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
 		FILE_OBJECT *file = ctx->PnPNotifications.FileObject;
@@ -1128,6 +1136,7 @@ static NDIS_STATUS TunInitializeEx(NDIS_HANDLE MiniportAdapterHandle, NDIS_HANDL
 		TunCsqReleaseLock,
 		TunCsqCompleteCanceledIrp);
 	InitializeListHead(&ctx->Device.ReadQueue.List);
+	ctx->Device.NblCancelId = (PVOID)(DriverCancelId | InterlockedIncrement64(&AdapterCancelId) & MAXULONG_PTR>>8);
 
 	KeInitializeSpinLock(&ctx->PacketQueue.Lock);
 
@@ -1361,8 +1370,10 @@ static NDIS_STATUS TunOidSet(_Inout_ TUN_CTX *ctx, _Inout_ NDIS_OID_REQUEST *Oid
 
 		KIRQL irql = ExAcquireSpinLockExclusive(&ctx->TransitionLock);
 		NDIS_DEVICE_POWER_STATE state = *(NDIS_DEVICE_POWER_STATE *)OidRequest->DATA.SET_INFORMATION.InformationBuffer;
-		if (InterlockedExchange((LONG *)&ctx->PowerState, state) == NdisDeviceStateD0 && state >= NdisDeviceStateD1)
+		if (InterlockedExchange((LONG *)&ctx->PowerState, state) == NdisDeviceStateD0 && state >= NdisDeviceStateD1) {
+			NdisCancelSendNetBufferLists(ctx->MiniportAdapterHandle, ctx->Device.NblCancelId);
 			TunQueueClear(ctx, STATUS_NDIS_LOW_POWER_STATE);
+		}
 		ExReleaseSpinLockExclusive(&ctx->TransitionLock, irql);
 
 		return NDIS_STATUS_SUCCESS;
@@ -1557,6 +1568,8 @@ NTSTATUS DriverEntry(DRIVER_OBJECT *DriverObject, UNICODE_STRING *RegistryPath)
 		return NDIS_STATUS_UNSUPPORTED_REVISION;
 	if (NdisVersion > NDIS_RUNTIME_VERSION_630)
 		NdisVersion = NDIS_RUNTIME_VERSION_630;
+
+	DriverCancelId = (ULONG_PTR)NdisGeneratePartialCancelId() << (sizeof(ULONG_PTR) - 1) * 8;
 
 	if (!NT_SUCCESS(status = IoRegisterPlugPlayNotification(EventCategoryDeviceInterfaceChange, 0,
 		(PVOID)&GUID_DEVINTERFACE_NET, DriverObject, TunPnPNotifyInterfaceChange, DriverObject,
