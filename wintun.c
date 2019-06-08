@@ -841,9 +841,6 @@ static NTSTATUS TunDispatch(DEVICE_OBJECT *DeviceObject, IRP *Irp)
 			!NT_SUCCESS(status = IoAcquireRemoveLock(&ctx->Device.RemoveLock, Irp)))
 			goto cleanup_complete_req;
 
-		if (!NT_SUCCESS(status = IoAcquireRemoveLock(&ctx->Device.RemoveLock, stack->FileObject)))
-			goto cleanup_complete_req_and_release_remove_lock;
-
 		ASSERT(InterlockedGet64(&ctx->Device.RefCount) < MAXLONG64);
 		if (InterlockedIncrement64(&ctx->Device.RefCount) > 0)
 			TunIndicateStatus(ctx->MiniportAdapterHandle, MediaConnectStateConnected);
@@ -861,7 +858,6 @@ static NTSTATUS TunDispatch(DEVICE_OBJECT *DeviceObject, IRP *Irp)
 				TunIndicateStatus(ctx->MiniportAdapterHandle, MediaConnectStateDisconnected);
 			TunQueueClear(ctx, NDIS_STATUS_SEND_ABORTED);
 		}
-		IoReleaseRemoveLock(&ctx->Device.RemoveLock, stack->FileObject);
 
 		status = STATUS_SUCCESS;
 		goto cleanup_complete_req;
@@ -1327,8 +1323,13 @@ static void TunHaltEx(NDIS_HANDLE MiniportAdapterContext, NDIS_HALT_ACTION HaltA
 	 * open it from the real path, in which case, maybe we should consider setting a deny-all DACL. */
 	IoDeleteSymbolicLink(&unicode_symbolic_name);
 
+	/* Closing handles by force invokes a bug-chek under DriverVerifier in WHQL.
+	 * Commented out, until we find a solution for it.
+	 */
+	/*
 	if (InterlockedGet64(&ctx->Device.RefCount))
 		TunForceHandlesClosed(ctx);
+	*/
 
 	/* Wait for processing IRP(s) to complete. */
 	IoAcquireRemoveLock(&ctx->Device.RemoveLock, NULL);
